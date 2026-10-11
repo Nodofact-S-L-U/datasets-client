@@ -38,7 +38,9 @@ MAX_DEPTH = 8
 MAX_PATH = 512
 MAX_PATH_SEGMENT = 255
 MAX_FILES = 10_000
-REQUIRED_METADATA = ("description", "source", "ci_allowed", "synthetic")
+REQUIRED_METADATA = ("description", "source", "ci_allowed", "data_class")
+DATA_CLASSES = ("synthetic", "public", "client")
+CLASS_REQUIRES = {"synthetic": (), "public": ("licence",), "client": ("approved_by",)}
 CHUNK = 1024 * 1024
 
 _SEGMENT = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -170,24 +172,58 @@ def check_files(files: object) -> tuple[FileEntry, ...]:
     return tuple(sorted(out, key=lambda f: f.path))
 
 
+def data_class_of(meta: object) -> str | None:
+    """The class a metadata object states: `data_class`, or `synthetic` for a
+    legacy `synthetic: true` with no `data_class`; None when it states none."""
+    if not isinstance(meta, Mapping):
+        return None
+    cls = meta.get("data_class")
+    if cls in DATA_CLASSES:
+        return cls
+    if cls is None and meta.get("synthetic") is True:
+        return "synthetic"
+    return None
+
+
 def check_metadata(meta: object) -> dict:
-    """The four keys a dataset must carry when it is created; `synthetic` must be
-    exactly `true`. The gateway checks this too; checking it here as well means
-    a copy into a folder or a blob container cannot drop the attestation."""
+    """The keys a dataset must carry when it is created, returned with
+    `data_class` set.
+
+    `description`, `source`, `ci_allowed` and `data_class` - one of `synthetic`,
+    `public` (which also needs `licence`) or `client` (which also needs
+    `approved_by`, the operator who approved it). A legacy `synthetic: true`
+    with no `data_class` reads as `synthetic`. No key names whose data it is.
+    The gateway checks this too, and more - only an operator's credential may
+    create `client` there; checking it here as well means a copy into a folder
+    or a blob container cannot drop the declaration."""
     if not isinstance(meta, Mapping):
         raise Refused("metadata must be an object", status=400)
-    missing = [k for k in REQUIRED_METADATA if k not in meta]
+    if "data_class" in meta:
+        cls = meta["data_class"]
+        if cls not in DATA_CLASSES:
+            raise Refused(f"metadata.data_class must be one of {', '.join(DATA_CLASSES)}",
+                          status=422)
+        if "synthetic" in meta and meta["synthetic"] is not (cls == "synthetic"):
+            raise Refused(f"metadata says data_class {cls} and a contradicting "
+                          "synthetic; drop `synthetic`", status=422)
+    elif "synthetic" in meta:
+        if meta["synthetic"] is not True:
+            raise Refused("metadata.synthetic must be true, or declare data_class: "
+                          "synthetic, public or client", status=422)
+        cls = "synthetic"
+    else:
+        cls = None
+    missing = [k for k in REQUIRED_METADATA
+               if k not in meta and not (k == "data_class" and cls is not None)]
+    missing += [k for k in CLASS_REQUIRES.get(cls, ()) if k not in meta]
     if missing:
         raise Refused(f"metadata is missing {', '.join(missing)}", status=400)
-    if meta["synthetic"] is not True:
-        raise Refused("metadata.synthetic must be true: only synthetic data is held",
-                      status=422)
     if not isinstance(meta["ci_allowed"], bool):
         raise Refused("metadata.ci_allowed must be true or false", status=400)
-    for key in ("description", "source"):
+    for key in ("description", "source", *CLASS_REQUIRES[cls]):
         if not isinstance(meta[key], str) or not meta[key].strip():
             raise Refused(f"metadata.{key} must be a non-empty string", status=400)
-    return dict(meta)
+    return dict(meta) | {"data_class": cls}
 
 
 # --- versions ---------------------------------------------------------------------

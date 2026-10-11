@@ -172,7 +172,18 @@ class BlobBackend:
             meta = _layout.check_metadata(metadata)
             self._check_leaf(name)
         else:
-            meta = dict(metadata) if metadata else self.resolve(name).metadata
+            before = self.resolve(name).metadata
+            meta = dict(metadata) if metadata else before
+            had, has = _layout.data_class_of(before), _layout.data_class_of(meta)
+            if had is not None and has is not None and has != had:
+                # The class says what kind of data the name holds; a version
+                # that changes it is not a correction, so it is not silent.
+                if not breaking:
+                    raise Refused(
+                        f"{name} holds {had} data and this version says {has}. A "
+                        "change of class is a breaking change: pass breaking if "
+                        "it is meant.", status=409)
+                meta = _layout.check_metadata(meta)
         if label:
             meta = meta | {"label": label}
         version = self.write_version(

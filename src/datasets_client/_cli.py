@@ -96,8 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("--parent", type=int, default=None,
                       help="the version this builds on (required for a new version)")
     push.add_argument("--metadata-file", default=None,
-                      help="JSON: description, source, ci_allowed, synthetic "
-                           "(required for a new dataset)")
+                      help="JSON: description, source, ci_allowed, data_class "
+                           "(synthetic; public + licence; client + approved_by) - "
+                           "required for a new dataset")
     push.add_argument("--label", default=None)
     push.add_argument("--breaking", action="store_true",
                       help="the file set or a CSV header changed, on purpose")
