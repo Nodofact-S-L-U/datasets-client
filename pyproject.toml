@@ -1,0 +1,23 @@
+[project]
+name = "datasets_client"
+version = "0.1.0"
+description = "Read shared, versioned datasets from a folder, a dataset gateway, Azure Blob or S3"
+requires-python = ">=3.10"
+license = "MIT"
+readme = "README.md"
+dependencies = []
+
+[project.optional-dependencies]
+azure = ["azure-storage-blob>=12.19", "azure-identity>=1.15"]
+s3 = ["boto3>=1.35"]
+
+[project.scripts]
+datasets-client = "datasets_client._cli:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["datasets_client*"]
