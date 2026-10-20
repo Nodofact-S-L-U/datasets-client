@@ -324,11 +324,19 @@ class GatewayBackend:
             raise
         return self._call("POST", f"/-/commit/{upload_id}", {}, timeout=COMMIT_TIMEOUT)
 
+    def abort(self, upload_id: str) -> dict:
+        """Release an open upload this credential began, so its declared size
+        stops counting against the quota now rather than in 24 hours."""
+        if not (isinstance(upload_id, str) and upload_id.isascii() and upload_id.isalnum()
+                and len(upload_id) <= 64):
+            raise Refused(f"{upload_id!r} is not an upload id", status=400)
+        return self._call("POST", f"/-/abort/{upload_id}", {})
+
     def _abort(self, upload_id: str) -> None:
         """Best effort, and never the error a caller sees: the upload already
         failed, and an abort that cannot be delivered expires in 24 hours anyway."""
         try:
-            self._call("POST", f"/-/abort/{upload_id}", {})
+            self.abort(upload_id)
         except Exception:  # noqa: BLE001, S110
             pass
 

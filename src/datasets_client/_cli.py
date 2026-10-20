@@ -103,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("--breaking", action="store_true",
                       help="the file set or a CSV header changed, on purpose")
 
+    ab = sub.add_parser("abort", parents=[common],
+                        help="release an open upload, so its quota frees now (gateway)")
+    ab.add_argument("upload_id")
+
     cp = sub.add_parser("copy", help="copy name[@v] from one backend to another")
     cp.add_argument("ref")
     cp.add_argument("--from", dest="src", required=True)
@@ -134,6 +138,9 @@ def run(args) -> int:
                       metadata=read_metadata(args.metadata_file), label=args.label,
                       breaking=args.breaking)
         print(f"published {got['name']}@{got['version']}")
+    elif args.command == "abort":
+        got = ds.abort(args.upload_id)
+        print(f"aborted {got.get('upload_id', args.upload_id)}: its quota is free now")
     return 0
 
 

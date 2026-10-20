@@ -204,6 +204,10 @@ class BlobBackend:
                       "to keep a pointer in. Copy the version and delete the old one.",
                       status=400)
 
+    def abort(self, *args, **kwargs):
+        raise Refused(f"abort releases an open upload on a dataset gateway; {self.url} "
+                      "holds no uploads to release.", status=400)
+
     def retract(self, *args, **kwargs):
         raise Refused(f"retract is an operator action on a dataset gateway; in {self.url}, delete "
                       "the version's directory.", status=400)

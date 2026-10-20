@@ -199,6 +199,11 @@ class Datasets:
         dataset as its next version; the source keeps a forward pointer."""
         return self.backend.move(source, dest, breaking=breaking, label=label)
 
+    def abort(self, upload_id: str) -> dict:
+        """Gateway only: release an open upload this credential began. A failed
+        or interrupted push aborts itself; this is for one that could not."""
+        return self.backend.abort(upload_id)
+
     def retract(self, name: str, version: int, reason: str) -> dict:
         """Operator, gateway only: tombstone one version and delete its files."""
         return self.backend.retract(name, version, reason)
