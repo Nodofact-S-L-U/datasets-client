@@ -18,7 +18,10 @@ Two things a URL can do that a caller must handle, both handled here:
 * **die early.** A presigned URL is signed with the gateway's role, and a role's
   credentials rotate, so a URL can answer `403` before its `expires_at`. A
   download that gets `403` re-resolves (`UrlExpired`, caught one level up); an
-  upload asks for fresh URLs (`/-/urls/<id>`) and retries that file.
+  upload asks for fresh URLs (`/-/urls/<id>`) and retries that file - or, for
+  a file in parts, carries on from the part that failed. Every URL lives 900 s
+  from `begin`, so a file in parts that takes longer also asks again between
+  parts, before they lapse (#494).
 * **be replayed.** A single-PUT URL carries `If-None-Match: *`, so a retry of a
   PUT that had in fact landed answers `412`. That is success: `commit` checks
   every object's size and checksum regardless.
@@ -57,6 +60,10 @@ few hundred MB, and the gateway's own budget is what bounds it."""
 IDENTITY_HEADER = "X-Datasets-Identity"
 """The header a forwarded user identity travels in, to the dataset gateway."""
 REFRESH_MARGIN = timedelta(seconds=30)
+SEND_ATTEMPTS = 3
+"""Refusals IN A ROW - with no part landing between them - before a file fails."""
+_EXPIRING = object()
+"""`_send` stopped between parts because the URLs are about to lapse: not a refusal."""
 PAGE = 1000
 
 
@@ -145,6 +152,16 @@ def _when(value) -> datetime | None:
         return datetime.fromisoformat(value) if isinstance(value, str) else None
     except ValueError:
         return None
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)  # noqa: UP017
+
+
+def _expiring(item: Mapping) -> bool:
+    """Are this file's URLs within `REFRESH_MARGIN` of their `expires_at`?"""
+    expires = _when(item.get("expires_at"))
+    return bool(expires and expires - REFRESH_MARGIN <= _now())
 
 
 class GatewayBackend:
@@ -295,6 +312,9 @@ class GatewayBackend:
         return self._call("POST", f"/-/commit/{upload_id}", {}, timeout=COMMIT_TIMEOUT)
 
     def _send_all(self, local_dir: Path, upload_id: str, begun: dict) -> None:
+        """Every file, resumable: a file in parts carries on from the part it
+        stopped at, on fresh URLs, whether it stopped because its URLs were
+        about to expire or because one died under it (#494)."""
         instructions = {f["path"]: f for f in begun.get("files", [])}
         for path in sorted(instructions):
             item = instructions[path]
@@ -302,45 +322,77 @@ class GatewayBackend:
                 continue
             _layout.check_path(path)
             source = local_dir.joinpath(*path.split("/"))
-            for attempt in range(3):
-                expires = _when(item.get("expires_at"))
-                if attempt or (expires and expires - REFRESH_MARGIN
-                               <= datetime.now(timezone.utc)):  # noqa: UP017
-                    fresh = self._call("POST", f"/-/urls/{upload_id}", {})
-                    item = next((f for f in fresh.get("files", []) if f["path"] == path),
-                                None)
-                    if item is None or "upload" not in item:
-                        raise BackendUnreachable(f"{path}: no fresh upload URL issued")
-                if self._send(source, item["upload"]):
+            done, refused = 0, 0
+            while True:
+                if refused or _expiring(item):
+                    item = self._fresh(upload_id, path)
+                before = done
+                done, why = self._send(source, item, done)
+                if why is None:
                     break
-            else:
-                raise BackendUnreachable(f"{path}: object storage refused the upload "
-                                         "three times with fresh URLs")
+                if why is _EXPIRING:
+                    continue
+                # A refusal that came after progress is the first of a new run:
+                # what is bounded is refusals in a row, not over a 4 TB file.
+                refused = 1 if done > before else refused + 1
+                if refused >= SEND_ATTEMPTS:
+                    raise BackendUnreachable(
+                        f"{path}: object storage refused the upload {SEND_ATTEMPTS} times "
+                        f"in a row with fresh URLs (last: {why})")
 
-    def _send(self, source: Path, upload: Mapping) -> bool:
-        """PUT one file (or each of its parts). False means "a URL died"."""
+    def _fresh(self, upload_id: str, path: str) -> dict:
+        fresh = self._call("POST", f"/-/urls/{upload_id}", {})
+        item = next((f for f in fresh.get("files", []) if f["path"] == path), None)
+        if item is None or "upload" not in item:
+            raise BackendUnreachable(f"{path}: no fresh upload URL issued")
+        return item
+
+    def _send(self, source: Path, item: Mapping, start: int) -> tuple[int, object]:
+        """PUT one file, or its parts from part index `start` on. Returns how
+        many are done and why it stopped: None when finished, `_EXPIRING` when
+        the URLs are about to lapse, else what the dead URL did.
+
+        **A dropped connection is a dead URL, not a dead gateway.** S3 refuses
+        an expired presigned PUT as soon as it reads the headers and closes the
+        socket while the body is still going up, so the sender sees an aborted
+        connection, never the `403` (`WinError 10053`, #494). Asking for fresh
+        URLs is right for both readings, and the attempts are bounded."""
+        upload = item["upload"]
         if "parts" in upload:
-            part_size = upload["part_size"]
+            part_size, parts = upload["part_size"], upload["parts"]
             with open(source, "rb") as f:
-                for part in upload["parts"]:
-                    start = (part["part_number"] - 1) * part_size
-                    status, _ = self.http.request(
-                        "PUT", part["url"], headers={"Content-Length": str(part["size_bytes"])},
-                        body=_Window(f, start, part["size_bytes"]), timeout=TRANSFER_TIMEOUT)
+                for i in range(start, len(parts)):
+                    # Never before the first part of a call: that is what keeps
+                    # a skewed clock from refreshing forever without sending.
+                    if i > start and _expiring(item):
+                        return i, _EXPIRING
+                    part = parts[i]
+                    offset = (part["part_number"] - 1) * part_size
+                    try:
+                        status, _ = self.http.request(
+                            "PUT", part["url"],
+                            headers={"Content-Length": str(part["size_bytes"])},
+                            body=_Window(f, offset, part["size_bytes"]),
+                            timeout=TRANSFER_TIMEOUT)
+                    except BackendUnreachable as exc:
+                        return i, f"part {part['part_number']}: {exc}"
                     if status == 403:
-                        return False
+                        return i, f"part {part['part_number']}: 403"
                     if status != 200:
                         raise BackendUnreachable(
                             f"{source.name} part {part['part_number']}: object storage "
                             f"answered {status}", status=status)
-            return True
+            return len(parts), None
         with open(source, "rb") as f:
-            status, _ = self.http.request("PUT", upload["url"], headers=upload["headers"],
-                                          body=f, timeout=TRANSFER_TIMEOUT)
+            try:
+                status, _ = self.http.request("PUT", upload["url"], headers=upload["headers"],
+                                              body=f, timeout=TRANSFER_TIMEOUT)
+            except BackendUnreachable as exc:
+                return 0, str(exc)
         if status == 403:
-            return False
+            return 0, "403"
         if status in (200, 412):
-            return True
+            return 1, None
         raise BackendUnreachable(f"{source.name}: object storage answered {status}",
                                  status=status)
 
