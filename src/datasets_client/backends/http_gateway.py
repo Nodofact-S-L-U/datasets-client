@@ -315,8 +315,22 @@ class GatewayBackend:
         upload_id = begun.get("upload_id")
         if not isinstance(upload_id, str):
             raise BackendUnreachable("begin answered no upload_id")
-        self._send_all(local_dir, upload_id, begun)
+        try:
+            self._send_all(local_dir, upload_id, begun)
+        except BaseException:
+            # Interrupted (Ctrl-C included) or given up: release the upload, or it
+            # holds its whole declared size against the quota for 24 hours (#497).
+            self._abort(upload_id)
+            raise
         return self._call("POST", f"/-/commit/{upload_id}", {}, timeout=COMMIT_TIMEOUT)
+
+    def _abort(self, upload_id: str) -> None:
+        """Best effort, and never the error a caller sees: the upload already
+        failed, and an abort that cannot be delivered expires in 24 hours anyway."""
+        try:
+            self._call("POST", f"/-/abort/{upload_id}", {})
+        except Exception:  # noqa: BLE001, S110
+            pass
 
     def _send_all(self, local_dir: Path, upload_id: str, begun: dict) -> None:
         """Every file, resumable: a file in parts carries on from the part it

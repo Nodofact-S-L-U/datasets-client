@@ -27,7 +27,7 @@ from datasets_client.errors import (
     UnsafePath,
 )
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 __all__ = [
     "BackendUnreachable", "ConfigError", "DatasetError", "DatasetInfo",
