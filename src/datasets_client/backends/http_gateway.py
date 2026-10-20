@@ -132,7 +132,14 @@ def _redact(url: str) -> str:
 
 
 class _Window:
-    """A byte range of an open file, readable like a file - one part's body."""
+    """A byte range of an open file, readable like a file - one PUT's body.
+
+    **Reads at least `CHUNK` at a time, whatever it is asked for.** `http.client`
+    sends a file-like body in `blocksize` reads, 8 KiB by default, one socket
+    write each, and over a ~90 ms round trip that alone held an upload to about
+    1 MB/s: 1.1 MB/s measured against 15.8 MB/s with 1 MiB writes (#391 D11).
+    `http.client` sends whatever `read` returns, so the size is set here rather
+    than on a connection `urllib` builds out of reach."""
 
     def __init__(self, f, start: int, length: int) -> None:
         self.f, self.left = f, length
@@ -141,7 +148,7 @@ class _Window:
     def read(self, n: int = -1) -> bytes:
         if self.left <= 0:
             return b""
-        n = self.left if n is None or n < 0 else min(n, self.left)
+        n = self.left if n is None or n < 0 else min(max(n, CHUNK), self.left)
         data = self.f.read(n)
         self.left -= len(data)
         return data
@@ -385,8 +392,10 @@ class GatewayBackend:
             return len(parts), None
         with open(source, "rb") as f:
             try:
-                status, _ = self.http.request("PUT", upload["url"], headers=upload["headers"],
-                                              body=f, timeout=TRANSFER_TIMEOUT)
+                status, _ = self.http.request(
+                    "PUT", upload["url"], headers=upload["headers"],
+                    body=_Window(f, 0, source.stat().st_size),
+                    timeout=TRANSFER_TIMEOUT)
             except BackendUnreachable as exc:
                 return 0, str(exc)
         if status == 403:
