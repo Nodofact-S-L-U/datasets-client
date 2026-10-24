@@ -343,7 +343,14 @@ class GatewayBackend:
     def _send_all(self, local_dir: Path, upload_id: str, begun: dict) -> None:
         """Every file, resumable: a file in parts carries on from the part it
         stopped at, on fresh URLs, whether it stopped because its URLs were
-        about to expire or because one died under it (#494)."""
+        about to expire or because one died under it (#494).
+
+        **One refresh serves every file still to send.** `/-/urls` re-signs the
+        whole upload, so its answer replaces every instruction, not just the
+        current file's. Keeping only the one asked for left every later file on
+        its `begin` URL, and after the first 900 s each file paid a re-sign of
+        the whole upload: about 1-3 MB/s on a gigabit line for a probe set of
+        2,700 files (#391 D27)."""
         instructions = {f["path"]: f for f in begun.get("files", [])}
         for path in sorted(instructions):
             item = instructions[path]
@@ -353,8 +360,10 @@ class GatewayBackend:
             source = local_dir.joinpath(*path.split("/"))
             done, refused = 0, 0
             while True:
+                item = instructions[path]
                 if refused or _expiring(item):
-                    item = self._fresh(upload_id, path)
+                    instructions.update(self._fresh(upload_id, path))
+                    item = instructions[path]
                 before = done
                 done, why = self._send(source, item, done)
                 if why is None:
@@ -369,12 +378,14 @@ class GatewayBackend:
                         f"{path}: object storage refused the upload {SEND_ATTEMPTS} times "
                         f"in a row with fresh URLs (last: {why})")
 
-    def _fresh(self, upload_id: str, path: str) -> dict:
+    def _fresh(self, upload_id: str, path: str) -> dict[str, dict]:
+        """Fresh instructions for every file in the upload, by path; `path` is
+        the file that asked, and it must have been issued a URL."""
         fresh = self._call("POST", f"/-/urls/{upload_id}", {})
-        item = next((f for f in fresh.get("files", []) if f["path"] == path), None)
-        if item is None or "upload" not in item:
+        files = {f["path"]: f for f in fresh.get("files", [])}
+        if "upload" not in files.get(path, {}):
             raise BackendUnreachable(f"{path}: no fresh upload URL issued")
-        return item
+        return {p: f for p, f in files.items() if "upload" in f}
 
     def _send(self, source: Path, item: Mapping, start: int) -> tuple[int, object]:
         """PUT one file, or its parts from part index `start` on. Returns how

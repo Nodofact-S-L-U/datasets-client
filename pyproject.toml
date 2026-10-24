@@ -1,6 +1,6 @@
 [project]
 name = "datasets_client"
-version = "0.2.4"
+version = "0.2.5"
 description = "Read shared, versioned datasets from a folder, a dataset gateway, Azure Blob or S3"
 requires-python = ">=3.10"
 license = "MIT"

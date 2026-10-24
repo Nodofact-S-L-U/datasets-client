@@ -193,9 +193,11 @@ def check_metadata(meta: object) -> dict:
     `public` (which also needs `licence`) or `client` (which also needs
     `approved_by`, the operator who approved it). A legacy `synthetic: true`
     with no `data_class` reads as `synthetic`. No key names whose data it is.
+    `client` data that CI may read (`ci_allowed: true`) also needs
+    `ci_approved_by`, the operator who approved that.
     The gateway checks this too, and more - only an operator's credential may
-    create `client` there; checking it here as well means a copy into a folder
-    or a blob container cannot drop the declaration."""
+    create `client` there, or open it to CI; checking it here as well means a
+    copy into a folder or a blob container cannot drop the declaration."""
     if not isinstance(meta, Mapping):
         raise Refused("metadata must be an object", status=400)
     if "data_class" in meta:
@@ -223,6 +225,11 @@ def check_metadata(meta: object) -> dict:
     for key in ("description", "source", *CLASS_REQUIRES[cls]):
         if not isinstance(meta[key], str) or not meta[key].strip():
             raise Refused(f"metadata.{key} must be a non-empty string", status=400)
+    if cls == "client" and meta["ci_allowed"] is True:
+        approval = meta.get("ci_approved_by")
+        if not isinstance(approval, str) or not approval.strip():
+            raise Refused("ci_allowed: true on client data needs `ci_approved_by`, the "
+                          "operator who approved CI reading it", status=403)
     return dict(meta) | {"data_class": cls}
 
 
