@@ -264,7 +264,8 @@ class GatewayBackend:
             name=resolved, version=got, files=_layout.check_files(doc.get("files")),
             metadata=doc.get("metadata") or {}, requested=name,
             pointers=tuple(doc.get("pointers") or ()), retracted=retracted,
-            published_at=doc.get("published_at"))
+            published_at=doc.get("published_at"),
+            writer=doc.get("writer") if isinstance(doc.get("writer"), dict) else None)
 
     def latest(self, name: str) -> int | None:
         try:

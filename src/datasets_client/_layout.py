@@ -37,7 +37,7 @@ MAX_SEGMENT = 64
 MAX_DEPTH = 8
 MAX_PATH = 512
 MAX_PATH_SEGMENT = 255
-MAX_FILES = 10_000
+MAX_FILES = 20_000
 REQUIRED_METADATA = ("description", "source", "ci_allowed", "data_class")
 DATA_CLASSES = ("synthetic", "public", "client")
 CLASS_REQUIRES = {"synthetic": (), "public": ("licence",), "client": ("approved_by",)}
@@ -248,6 +248,8 @@ class Version:
     pointers: tuple[str, ...] = ()
     retracted: tuple[int, ...] = ()
     published_at: str | None = None
+    writer: dict | None = None
+    """Who published it, where the backend records that (a gateway only)."""
 
     def file(self, path: str) -> FileEntry:
         for f in self.files:

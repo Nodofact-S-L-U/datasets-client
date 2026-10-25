@@ -1,4 +1,4 @@
-"""`python -m datasets_client` (also `datasets-client`): ls, pull, push, copy.
+"""`python -m datasets_client` (also `datasets-client`): ls, pull, push, copy, evals.
 
 Every command takes `--url` (default `DATASETS_URL`) and, for a gateway,
 `--token-file`. `pull` and `push` are copies between a backend and a local
@@ -7,6 +7,9 @@ container into a gateway, or the reverse, is one command.
 
 Written in Python rather than shell on purpose: Git Bash rewrites any argument
 that looks like `/a/path`, and a dataset name is exactly that shape.
+
+`evals <verb> ...` is the evaluation layer (`datasets_client.evals`), with its
+own arguments: `evals --help`, or `evals --help-json` for every verb as JSON.
 
 Exit status: 0 done, 1 refused or failed (the named error is printed), 2 a
 usage or configuration problem.
@@ -114,10 +117,18 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--from-token-file", default=None)
     cp.add_argument("--to-token-file", default=None)
     cp.add_argument("--breaking", action="store_true")
+
+    ev = sub.add_parser("evals", add_help=False,
+                        help="evaluation runs: record, publish, register, query "
+                             "(evals --help)")
+    ev.add_argument("rest", nargs=argparse.REMAINDER)
     return parser
 
 
 def run(args) -> int:
+    if args.command == "evals":
+        from datasets_client.evals._cli import main as evals_main
+        return evals_main(args.rest)
     if args.command == "copy":
         name, version = parse_ref(args.ref)
         v = copy(Datasets(args.src, token=read_token(args.from_token_file)),
@@ -145,6 +156,11 @@ def run(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["evals"]:
+        # Its own parser, whole: argparse would otherwise claim `--help` here.
+        from datasets_client.evals._cli import main as evals_main
+        return evals_main(argv[1:])
     args = build_parser().parse_args(argv)
     try:
         return run(args)
