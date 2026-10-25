@@ -48,38 +48,71 @@ class Cache:
         # One subtree per backend URL: the same name in two backends is two
         # datasets, and must not answer each other's reads.
         self.base = self.root / hashlib.sha256(backend_id.encode()).hexdigest()[:16]
+        # RESOLVE EACH DIRECTORY ONCE, PARSE EACH LISTING ONCE (#391 D36). A
+        # tree of 11,544 files spent ~6 minutes of CPU on Windows before its
+        # first transfer: every file paid ~14 `Path.resolve()` calls (the root
+        # and each parent again, each a `_getfinalpathname` syscall, ~1 ms) and
+        # `have` re-read and re-parsed the whole listing manifest per file -
+        # quadratic on any OS. Both are memoised per instance; the listing memo
+        # is keyed on the manifest's stat, so a rewritten one is read again.
+        self._root_resolved: Path | None = None
+        self._dirs: dict[Path, Path] = {}
+        self._listings: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 
     # --- where things go -------------------------------------------------
 
     def _contained(self, path: Path) -> Path:
-        root = self.root.resolve()
+        if self._root_resolved is None:
+            self._root_resolved = self.root.resolve()
+        root = self._root_resolved
         resolved = path.resolve()
         if not resolved.is_relative_to(root):
             raise UnsafePath(f"{path} resolves outside the cache root {root}")
         return resolved
 
+    def _contained_dir(self, path: Path) -> Path:
+        """`_contained` for a DIRECTORY, once per path per instance. A symlink
+        planted later under a checked directory is still caught: `file_path`
+        re-checks any target that is itself a link."""
+        hit = self._dirs.get(path)
+        if hit is None:
+            hit = self._dirs[path] = self._contained(path)
+        return hit
+
     def dataset_dir(self, name: str) -> Path:
         _layout.check_name(name)
-        return self._contained(self.base.joinpath(*name.split("/")))
+        return self._contained_dir(self.base.joinpath(*name.split("/")))
 
     def version_dir(self, name: str, version: int) -> Path:
-        return self._contained(self.dataset_dir(name) / f"v{version}")
+        return self._contained_dir(self.dataset_dir(name) / f"v{version}")
 
     def _manifest(self, name: str, version: int) -> Path:
         return self.dataset_dir(name) / f"v{version}.{_layout.LISTING_FILE}"
 
     def file_path(self, name: str, version: int, path: str) -> Path:
         _layout.check_path(path)
-        return self._contained(self.version_dir(name, version).joinpath(*path.split("/")))
+        *parents, leaf = path.split("/")
+        target = self._contained_dir(self.version_dir(name, version).joinpath(*parents)) / leaf
+        # `check_path` already refused `..`, absolute paths and separators, so
+        # only a link can lead out from a contained directory: resolve those.
+        return self._contained(target) if target.is_symlink() else target
 
     # --- reading ---------------------------------------------------------
 
     def _known(self, name: str, version: int) -> dict[str, str]:
+        manifest = self._manifest(name, version)
         try:
-            doc = json.loads(self._manifest(name, version).read_bytes())
-            return {f["path"]: f["sha256"] for f in doc["files"]}
+            st = manifest.stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+            cached = self._listings.get(manifest)
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
+            doc = json.loads(manifest.read_bytes())
+            known = {f["path"]: f["sha256"] for f in doc["files"]}
         except (OSError, ValueError, KeyError, TypeError):
             return {}
+        self._listings[manifest] = (stamp, known)
+        return known
 
     def have(self, v: Version, entry: FileEntry) -> Path | None:
         """The cached file, if it is this version's and whole; else None."""
@@ -127,12 +160,13 @@ class Cache:
         shutil.rmtree(self.version_dir(v.name, v.version), ignore_errors=True)
         manifest.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(manifest, body)
+        self._listings.pop(manifest, None)  # never trust a stamp across our own rewrite
 
     def store(self, v: Version, entry: FileEntry, fill: Callable[[Sink], None]) -> Path:
         """Fill one file through `fill(sink)`, verify it, and move it into place."""
         target = self.file_path(v.name, v.version, entry.path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        self._contained(target.parent)
+        self._contained_dir(target.parent)
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".part-")
         h, size = hashlib.sha256(), 0
         try:

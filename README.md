@@ -5,7 +5,7 @@ Read shared, versioned datasets from a local folder, a dataset gateway, Azure Bl
 ## Install
 
 ```
-pip install "datasets_client @ https://github.com/Nodofact-S-L-U/datasets-client/releases/download/v0.3.1/datasets_client-0.3.1-py3-none-any.whl"
+pip install "datasets_client @ https://github.com/Nodofact-S-L-U/datasets-client/releases/download/v0.3.2/datasets_client-0.3.2-py3-none-any.whl"
 ```
 
 Add `[azure]` or `[s3]` for those backends. The base install has no dependencies.
