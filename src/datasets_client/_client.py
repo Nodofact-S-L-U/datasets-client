@@ -20,7 +20,10 @@ import hashlib
 import os
 import shutil
 import tempfile
-from collections.abc import Mapping
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +34,89 @@ from datasets_client.backends import open_backend
 from datasets_client.errors import BackendUnreachable, DatasetError, IntegrityError, Refused
 
 URL_VARIABLE = "DATASETS_URL"
+
+# A VERSION'S FILES ARE FETCHED SEVERAL AT A TIME (#391 D35). One at a time, a
+# set of ~3,900 files is paced by the round trip per file, not the bandwidth:
+# measured 2.6 MB/s on a wired Linux box and 0.8 MB/s on a Windows laptop, where
+# 16 at a time gave 24 and 38 MB/s on the same sets. Each worker goes through the
+# same `Cache.store` / verify-then-rename path as before, so a file is either
+# complete and checked or absent - concurrency changes the order, not the rule.
+THREADS_VARIABLE = "DATASETS_DOWNLOAD_THREADS"
+DEFAULT_THREADS = 8
+# A transfer the remote resets is retried, per file, with backoff: one
+# `WinError 10054` on one file of thousands used to fail the whole read (D35).
+# Only a transport failure or a 5xx is retried; a 403 (re-resolve), a 404
+# (retracted) and a hash mismatch are answers, not accidents.
+RETRIES = 3
+BACKOFF_SECONDS = 1.0
+RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+
+Progress = Callable[[int, int, int, int], None]
+"""`progress(files_done, files_total, bytes_done, bytes_total)`, called from a
+worker thread after each file lands. The library never prints; the CLI does."""
+
+
+def resolve_threads(configured: int | None = None) -> int:
+    """The bounded pool's size: the argument, else `DATASETS_DOWNLOAD_THREADS`,
+    else 8. A value that is not a positive integer is refused, not clamped."""
+    raw = configured if configured is not None else os.environ.get(THREADS_VARIABLE)
+    if raw is None or raw == "":
+        return DEFAULT_THREADS
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 1:
+        raise ValueError(f"{THREADS_VARIABLE} must be a positive integer, got {raw!r}")
+    return n
+
+
+def _retrying(call: Callable[[], object], *, sleep=time.sleep) -> object:
+    for attempt in range(RETRIES + 1):
+        try:
+            return call()
+        except BackendUnreachable as exc:
+            transient = exc.status is None or exc.status in RETRYABLE_STATUS
+            if attempt == RETRIES or not transient:
+                raise
+            sleep(BACKOFF_SECONDS * 2 ** attempt)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _each(entries: Iterable[FileEntry], fetch: Callable[[FileEntry], object], *,
+          threads: int, progress: Progress | None, sleep=time.sleep) -> None:
+    """`fetch(entry)` for every entry, at most `threads` at once, each retried
+    on a transient failure. The first error stops the rest: queued fetches are
+    cancelled, running ones finish, and that error is raised - so a `UrlExpired`
+    still reaches the caller's single re-resolve."""
+    todo = list(entries)
+    total_files, total_bytes = len(todo), sum(e.size_bytes for e in todo)
+    done = {"files": 0, "bytes": 0}
+    lock = threading.Lock()
+
+    def one(entry: FileEntry) -> None:
+        _retrying(lambda: fetch(entry), sleep=sleep)
+        if progress is not None:
+            with lock:
+                done["files"] += 1
+                done["bytes"] += entry.size_bytes
+                snapshot = (done["files"], total_files, done["bytes"], total_bytes)
+            progress(*snapshot)
+
+    if threads <= 1 or total_files <= 1:
+        for entry in todo:
+            one(entry)
+        return
+    pool = ThreadPoolExecutor(max_workers=min(threads, total_files),
+                              thread_name_prefix="datasets-fetch")
+    futures = [pool.submit(one, e) for e in todo]
+    try:
+        for future in as_completed(futures):
+            future.result()
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
 
 
 @dataclass(frozen=True)
@@ -58,13 +144,17 @@ class Datasets:
     """
 
     def __init__(self, url: str | None = None, *, token: str | None = None,
-                 cache_dir: str | os.PathLike | None = None, transport=None) -> None:
+                 cache_dir: str | os.PathLike | None = None, transport=None,
+                 download_threads: int | None = None,
+                 progress: Progress | None = None) -> None:
         self.url = url if url is not None else os.environ.get(URL_VARIABLE)
         self._token = token
         self._transport = transport
         self._cache_dir = cache_dir
         self._backend = None
         self._cache: Cache | None = None
+        self.download_threads = resolve_threads(download_threads)
+        self.progress = progress
 
     # --- plumbing -----------------------------------------------------------
 
@@ -144,11 +234,18 @@ class Datasets:
         for attempt in range(2):
             wanted = [v.file(path)] if path is not None else list(v.files)
             self.cache.begin(v)
+            missing = [e for e in wanted if self.cache.have(v, e) is None]
+            # Every directory first, in THIS thread. Workers that create and
+            # resolve the same directories at once made `Path.resolve()` on
+            # Windows answer a non-final path, and the cache's containment check
+            # then refused a correct file as "outside the cache root".
+            for parent in {self.cache.file_path(v.name, v.version, e.path).parent
+                           for e in missing}:
+                parent.mkdir(parents=True, exist_ok=True)
             try:
-                for entry in wanted:
-                    if self.cache.have(v, entry) is None:
-                        self.cache.store(v, entry, lambda sink, e=entry, v=v:
-                                         self.backend.download(v, e, sink))
+                _each(missing, lambda e, v=v: self.cache.store(
+                          v, e, lambda sink: self.backend.download(v, e, sink)),
+                      threads=self.download_threads, progress=self.progress)
                 return v
             except UrlExpired:
                 if attempt:
@@ -266,14 +363,16 @@ def _download_all(src: Datasets, v: Version, staging: Path) -> Version:
 
     done: set[str] = set()
     for attempt in range(2):
+        def fetch(entry: FileEntry, v: Version = v) -> None:
+            _download_verified(src, v, entry, staging.joinpath(*entry.path.split("/")))
+            done.add(entry.path)  # one add per worker; set.add is atomic under the GIL
+
+        todo = [e for e in v.files if e.path not in done]
+        for parent in {staging.joinpath(*e.path.split("/")).parent for e in todo}:
+            parent.mkdir(parents=True, exist_ok=True)  # in this thread, as in `_fill`
         try:
-            for entry in v.files:
-                if entry.path in done:
-                    continue
-                target = staging.joinpath(*entry.path.split("/"))
-                target.parent.mkdir(parents=True, exist_ok=True)
-                _download_verified(src, v, entry, target)
-                done.add(entry.path)
+            _each(todo, fetch,
+                  threads=src.download_threads, progress=src.progress)
             return v
         except UrlExpired:
             if attempt:

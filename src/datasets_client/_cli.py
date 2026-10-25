@@ -63,6 +63,24 @@ def human(n: int | None) -> str:
     return f"{n} B"
 
 
+def _progress_printer(every: float = 10.0, clock=None, out=None):
+    """A `pull` of thousands of files used to be silent for an hour (#391 D35).
+    One line on stderr at most every `every` seconds, and always the last."""
+    import time
+
+    clock = clock or time.monotonic
+    out = out or sys.stderr
+    last = [clock() - every]
+
+    def report(files_done: int, files_total: int, bytes_done: int, bytes_total: int) -> None:
+        now = clock()
+        if files_done == files_total or now - last[0] >= every:
+            last[0] = now
+            print(f"  fetched {files_done}/{files_total} files, "
+                  f"{human(bytes_done)} of {human(bytes_total)}", file=out, flush=True)
+    return report
+
+
 def print_listing(rows) -> None:
     if not rows:
         print("(no datasets under that prefix)")
@@ -137,7 +155,8 @@ def run(args) -> int:
         print(f"copied {v.name}@{v.version} ({len(v.files)} files) to {args.dst}")
         return 0
 
-    ds = Datasets(args.url, token=read_token(args.token_file))
+    extra = {"progress": _progress_printer()} if args.command == "pull" else {}
+    ds = Datasets(args.url, token=read_token(args.token_file), **extra)
     if args.command == "ls":
         print_listing(ds.list(args.prefix))
     elif args.command == "pull":

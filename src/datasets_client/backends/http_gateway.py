@@ -29,6 +29,7 @@ Two things a URL can do that a caller must handle, both handled here:
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -114,7 +115,11 @@ class UrllibTransport:
                 return resp.status
         except urllib.error.HTTPError as exc:
             return exc.code
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        # `http.client.IncompleteRead` is not an `OSError`: a body cut short
+        # mid-stream used to escape as a raw exception instead of the
+        # transport failure the client retries (#391 D35).
+        except (urllib.error.URLError, OSError, ValueError,
+                http.client.HTTPException) as exc:
             raise BackendUnreachable(f"GET {_redact(url)}: {exc}") from exc
 
 
